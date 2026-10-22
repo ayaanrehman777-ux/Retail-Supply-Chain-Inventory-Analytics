@@ -1,0 +1,5 @@
+order_id,supplier_id,store_id,product_id,order_date,expected_delivery_date,actual_delivery_date,quantity_ordered,order_status,delay_days,delivery_status
+5001,1,1,101,2026-10-10,2026-10-14,2026-10-15,100,Delivered,1.0,Late
+5002,2,1,103,2026-10-11,2026-10-15,2026-10-15,50,Delivered,0.0,On Time
+5003,3,2,104,2026-10-16,2026-10-21,,40,Pending,,Not Delivered
+5004,1,3,105,2026-10-12,2026-10-16,2026-10-18,200,Delivered,2.0,Late

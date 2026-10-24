@@ -1,12 +1,11 @@
 import os
 import pandas as pd
-
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL
 
 
-# 1. DATABASE CONNECTION
+# 1. CONNECT TO MYSQL
 
 load_dotenv()
 
@@ -21,179 +20,104 @@ db_url = URL.create(
 
 engine = create_engine(db_url)
 
-print("Database connection configured!")
+print("Database connected!")
 
 
+# 2. EXTRACT DATA
 
-# 2. EXTRACT
+products = pd.read_sql("SELECT * FROM products", engine)
+suppliers = pd.read_sql("SELECT * FROM suppliers", engine)
+stores = pd.read_sql("SELECT * FROM stores", engine)
+sales = pd.read_sql("SELECT * FROM sales", engine)
+inventory = pd.read_sql("SELECT * FROM inventory", engine)
+orders = pd.read_sql("SELECT * FROM purchase_orders", engine)
 
-
-print("\nExtracting data...")
-
-tables = [
-    "products",
-    "suppliers",
-    "stores",
-    "inventory",
-    "sales",
-    "purchase_orders"
-]
-
-data = {}
-
-with engine.connect() as connection:
-
-    for table in tables:
-
-        query = text(f"SELECT * FROM `{table}`")
-
-        data[table] = pd.read_sql(
-            query,
-            connection
-        )
-
-        print(
-            f"{table}: {len(data[table])} records extracted"
-        )
+print("Data extracted successfully!")
 
 
+# 3. TRANSFORM DATA
 
-# 3. TRANSFORM DIMENSIONS
+# Dimension tables
+dim_products = products.copy()
+dim_suppliers = suppliers[["supplier_id", "supplier_name", "city"]].copy()
+dim_stores = stores.copy()
 
-dim_products = data["products"].copy()
+# Calculate sales revenue
+sales["revenue"] = sales["quantity_sold"] * sales["unit_selling_price"]
 
-dim_suppliers = data["suppliers"][
-    ["supplier_id", "supplier_name", "city"]
-].copy()
-
-dim_stores = data["stores"].copy()
-
-
-# 4. TRANSFORM SALES
-
-fact_sales = data["sales"].copy()
-
-fact_sales["revenue"] = (
-    fact_sales["quantity_sold"]
-    * fact_sales["unit_selling_price"]
-)
-
-
-# 5. TRANSFORM INVENTORY
-
-fact_inventory = data["inventory"].merge(
-    data["products"][
-        ["product_id", "unit_cost"]
-    ],
+# Calculate inventory value
+inventory = inventory.merge(
+    products[["product_id", "unit_cost"]],
     on="product_id",
-    how="left",
-    validate="many_to_one"
+    how="left"
 )
 
-if fact_inventory["unit_cost"].isnull().any():
-    raise ValueError("Inventory product cost missing!")
+inventory["inventory_value"] = inventory["stock_qty"] * inventory["unit_cost"]
 
-fact_inventory["inventory_value"] = (
-    fact_inventory["stock_qty"]
-    * fact_inventory["unit_cost"]
-)
+# 3 BASIC DATA VALIDATION CHECKS
 
-fact_inventory = fact_inventory[
-    [
-        "store_id",
-        "product_id",
-        "stock_qty",
-        "last_updated",
-        "inventory_value"
-    ]
-]
+if sales["sale_id"].duplicated().any():
+    raise ValueError("Duplicate sales found!")
 
-
-
-# 6. TRANSFORM PURCHASE ORDERS
-
-
-fact_orders = data["purchase_orders"].copy()
-
-fact_orders["expected_delivery_date"] = pd.to_datetime(
-    fact_orders["expected_delivery_date"]
-)
-
-fact_orders["actual_delivery_date"] = pd.to_datetime(
-    fact_orders["actual_delivery_date"]
-)
-
-fact_orders["delay_days"] = (
-    fact_orders["actual_delivery_date"]
-    - fact_orders["expected_delivery_date"]
-).dt.days
-
-
-def get_delivery_status(row):
-
-    if row["order_status"] == "Cancelled":
-        return "Cancelled"
-
-    if pd.isna(row["actual_delivery_date"]):
-        return "Not Delivered"
-
-    if (
-        row["actual_delivery_date"]
-        <= row["expected_delivery_date"]
-    ):
-        return "On Time"
-
-    return "Late"
-
-
-fact_orders["delivery_status"] = fact_orders.apply(
-    get_delivery_status,
-    axis=1
-)
-
-
-# 7. DATA VALIDATION
-
-
-print("\nValidating data...")
-
-if fact_sales["sale_id"].duplicated().any():
-    raise ValueError("Duplicate sale IDs found!")
-
-if fact_orders["order_id"].duplicated().any():
-    raise ValueError("Duplicate order IDs found!")
-
-if (fact_sales["quantity_sold"] <= 0).any():
+if (sales["quantity_sold"] <= 0).any():
     raise ValueError("Invalid sales quantity!")
 
-if (fact_inventory["stock_qty"] < 0).any():
-    raise ValueError("Negative stock found!")
+if inventory["unit_cost"].isnull().any():
+    raise ValueError("Missing product cost!")
 
-if fact_sales["revenue"].isnull().any():
-    raise ValueError("Missing revenue values!")
+inventory = inventory[
+    ["store_id", "product_id", "stock_qty", "last_updated", "inventory_value"]
+]
 
-print("Data validation successful!")
+# Calculate delivery delay
+orders["expected_delivery_date"] = pd.to_datetime(
+    orders["expected_delivery_date"]
+)
+
+orders["actual_delivery_date"] = pd.to_datetime(
+    orders["actual_delivery_date"]
+)
+
+orders["delay_days"] = (
+    orders["actual_delivery_date"] - orders["expected_delivery_date"]
+).dt.days
+
+# Calculate delivery status
+orders["delivery_status"] = "Late"
+
+orders.loc[
+    orders["actual_delivery_date"] <= orders["expected_delivery_date"],
+    "delivery_status"
+] = "On Time"
+
+orders.loc[
+    orders["actual_delivery_date"].isna(),
+    "delivery_status"
+] = "Not Delivered"
+
+orders.loc[
+    orders["order_status"] == "Cancelled",
+    "delivery_status"
+] = "Cancelled"
+
+print("Data transformed and validated!")
 
 
+# 4. LOAD DATA INTO ANALYTICAL DATABASE
 
-# 8. LOAD INTO MYSQL OLAP
-
-
-print("\nLoading analytical tables...")
-
-analytics_tables = {
+tables = {
     "dim_products": dim_products,
     "dim_suppliers": dim_suppliers,
     "dim_stores": dim_stores,
-    "fact_sales": fact_sales,
-    "fact_inventory": fact_inventory,
-    "fact_purchase_orders": fact_orders
+    "fact_sales": sales,
+    "fact_inventory": inventory,
+    "fact_purchase_orders": orders
 }
 
+with engine.begin() as conn:
 
-with engine.begin() as connection:
-
-    for table in [
+    # Delete old data
+    for name in [
         "fact_sales",
         "fact_inventory",
         "fact_purchase_orders",
@@ -201,34 +125,27 @@ with engine.begin() as connection:
         "dim_suppliers",
         "dim_stores"
     ]:
-        connection.execute(
-            text(f"DELETE FROM retail_analytics.`{table}`")
-        )
+        conn.execute(text(f"DELETE FROM retail_analytics.`{name}`"))
 
-    for table, dataframe in analytics_tables.items():
-
-        dataframe.to_sql(
-            name=table,
-            con=connection,
+    # Insert updated data
+    for name, df in tables.items():
+        df.to_sql(
+            name=name,
+            con=conn,
             schema="retail_analytics",
             if_exists="append",
             index=False
         )
 
-        print(f"{table} loaded successfully!")
+        print(f"{name} loaded successfully!")
 
 
-# 9. FINAL RESULT
+# 5. FINAL RESULT
 
-print("\nETL PIPELINE COMPLETED SUCCESSFULLY!")
+print("\nETL COMPLETED SUCCESSFULLY!")
 
-print("Total Revenue:", fact_sales["revenue"].sum())
-
-print(
-    "Total Inventory Value:",
-    fact_inventory["inventory_value"].sum()
-)
-
-print("Total Purchase Orders:", len(fact_orders))
+print("Total Revenue:", sales["revenue"].sum())
+print("Total Inventory Value:", inventory["inventory_value"].sum())
+print("Total Purchase Orders:", len(orders))
 
 engine.dispose()
